@@ -71,6 +71,8 @@
 #if defined __i386__ && __ELF_WORD_SIZE == 64
 #error 32-bit application on 64-bit OS is not supported.
 #endif
+#elif defined _hpux || defined __hpux
+#define ELF_OSABI     ELFOSABI_HPUX
 #else
 #error unsupported OS
 #endif
@@ -86,6 +88,8 @@
 #define SHT_PLT_REL   SHT_RELA
 #define Elf_Plt_Rel   Elf_Rela
 #define PLT_SECTION_NAME ".rela.plt"
+#define R_GLOBAL_DATA R_X86_64_GLOB_DAT
+#define REL_DYN_SECTION_NAME ".rela.dyn"
 #elif defined __i386__ || defined __i386
 #define ELF_DATA      ELFDATA2LSB
 #define E_MACHINE     EM_386
@@ -93,6 +97,31 @@
 #define SHT_PLT_REL   SHT_REL
 #define Elf_Plt_Rel   Elf_Rel
 #define PLT_SECTION_NAME ".rel.plt"
+#define R_GLOBAL_DATA R_386_GLOB_DAT
+#define REL_DYN_SECTION_NAME ".rel.dyn"
+#elif 0 /* disabled because not tested */ && (defined __sparcv9 || defined __sparc_v9__)
+#define ELF_DATA      ELFDATA2MSB
+#define E_MACHINE     EM_SPARCV9
+#define R_JUMP_SLOT   R_SPARC_JMP_SLOT
+#define SHT_PLT_REL   SHT_RELA
+#define Elf_Plt_Rel   Elf_Rela
+#define PLT_SECTION_NAME ".rela.plt"
+#elif 0 /* disabled because not tested */ && (defined __sparc || defined __sparc__)
+#define ELF_DATA      ELFDATA2MSB
+#define E_MACHINE     EM_SPARC
+#define E_MACHINE_ALT EM_SPARC32PLUS
+#define R_JUMP_SLOT   R_SPARC_JMP_SLOT
+#define SHT_PLT_REL   SHT_RELA
+#define Elf_Plt_Rel   Elf_Rela
+#define PLT_SECTION_NAME ".rela.plt"
+#elif 0 /* disabled because not tested */ && (defined __ia64 || defined __ia64__)
+#define ELF_DATA      ELFDATA2MSB
+#define E_MACHINE     EM_IA_64
+#define R_JUMP_SLOT   R_IA64_IPLTMSB
+#define SHT_PLT_REL   SHT_RELA
+#define Elf_Plt_Rel   Elf_Rela
+#define PLT_SECTION_NAME ".rela.plt"
+*/
 #else
 #error E_MACHINE is not defined.
 #endif
@@ -102,7 +131,10 @@
 #define ELF_CLASS     ELFCLASS64
 #endif
 #define SIZE_T_FMT "lu"
+#define ELF_WORD_FMT "u"
+#define ELF_XWORD_FMT "lu"
 #define Elf_Half Elf64_Half
+#define Elf_Xword Elf64_Xword
 #define Elf_Addr Elf64_Addr
 #define Elf_Ehdr Elf64_Ehdr
 #define Elf_Phdr Elf64_Phdr
@@ -121,7 +153,15 @@
 #define ELF_CLASS     ELFCLASS32
 #endif
 #define SIZE_T_FMT "u"
+#ifdef __sun
+#define ELF_WORD_FMT "lu"
+#define ELF_XWORD_FMT "lu"
+#else
+#define ELF_WORD_FMT "u"
+#define ELF_XWORD_FMT "u"
+#endif
 #define Elf_Half Elf32_Half
+#define Elf_Xword Elf32_Word
 #define Elf_Addr Elf32_Addr
 #define Elf_Ehdr Elf32_Ehdr
 #define Elf_Phdr Elf32_Phdr
@@ -151,6 +191,7 @@ struct plthook {
     size_t dynstr_size;
     const Elf_Plt_Rel *plt;
     size_t plt_cnt;
+    Elf_Xword r_type;
 #ifdef PT_GNU_RELRO
     const char *relro_start;
     const char *relro_end;
@@ -241,7 +282,7 @@ static int plthook_open_executable(plthook_t **plthook_out)
     char fname[128];
     int fd;
 
-    sprintf(fname, "/proc/%d/map", pid);
+    sprintf(fname, "/proc/%ld/map", (long)pid);
     fd = open(fname, O_RDONLY);
     if (fd == -1) {
         set_errmsg("Could not open %s: %s", fname,
@@ -255,7 +296,7 @@ static int plthook_open_executable(plthook_t **plthook_out)
         return PLTHOOK_INTERNAL_ERROR;
     }
     close(fd);
-    sprintf(fname, "/proc/%d/object/a.out", pid);
+    sprintf(fname, "/proc/%ld/object/a.out", (long)pid);
     return plthook_open_real(plthook_out, (const char*)prmap.pr_vaddr, fname);
 #elif defined __FreeBSD__
     return plthook_open_shared_library(plthook_out, NULL);
@@ -285,7 +326,7 @@ static int plthook_open_shared_library(plthook_t **plthook_out, const char *file
 
 static int plthook_open_real(plthook_t **plthook_out, const char *base, const char *filename)
 {
-    const Elf_Ehdr *ehdr = (Elf_Ehdr *)base;
+    Elf_Ehdr ehdr;
     const Elf_Shdr *shdr;
     size_t shdr_size;
     int fd = -1;
@@ -312,30 +353,36 @@ static int plthook_open_real(plthook_t **plthook_out, const char *base, const ch
         return PLTHOOK_OUT_OF_MEMORY;
     }
 
-    /* sanity check */
-    rv = check_elf_header(ehdr);
-    if (rv != 0) {
-        goto error_exit;
-    }
-    if (ehdr->e_type == ET_DYN) {
-        plthook->base = base;
-    }
-    plthook->phdr = (const Elf_Phdr *)(plthook->base + ehdr->e_phoff);
-    plthook->phnum = ehdr->e_phnum;
     fd = open(filename, O_RDONLY, 0);
     if (fd == -1) {
         set_errmsg("Could not open %s: %s", filename, strerror(errno));
         rv = PLTHOOK_FILE_NOT_FOUND;
         goto error_exit;
     }
-    shdr_size = ehdr->e_shnum * ehdr->e_shentsize;
+    if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+        set_errmsg("failed to read the ELF header.");
+        rv = PLTHOOK_INVALID_FILE_FORMAT;
+        goto error_exit;
+    }
+
+    /* sanity check */
+    rv = check_elf_header(&ehdr);
+    if (rv != 0) {
+        goto error_exit;
+    }
+    if (ehdr.e_type == ET_DYN) {
+        plthook->base = base;
+    }
+    plthook->phdr = (const Elf_Phdr *)(plthook->base + ehdr.e_phoff);
+    plthook->phnum = ehdr.e_phnum;
+    shdr_size = ehdr.e_shnum * ehdr.e_shentsize;
     plthook->shdr = calloc(1, shdr_size);
     if (plthook->shdr == NULL) {
         set_errmsg("failed to allocate memory: %" SIZE_T_FMT " bytes", shdr_size);
         rv = PLTHOOK_OUT_OF_MEMORY;
         goto error_exit;
     }
-    offset = ehdr->e_shoff;
+    offset = ehdr.e_shoff;
     if ((rv = lseek(fd, offset, SEEK_SET)) != offset) {
         set_errmsg("failed to seek to the section header table.");
         rv = PLTHOOK_INVALID_FILE_FORMAT;
@@ -346,15 +393,15 @@ static int plthook_open_real(plthook_t **plthook_out, const char *base, const ch
         rv = PLTHOOK_INVALID_FILE_FORMAT;
         goto error_exit;
     }
-    plthook->shnum = ehdr->e_shnum;
-    plthook->shstrtab_size = plthook->shdr[ehdr->e_shstrndx].sh_size;
+    plthook->shnum = ehdr.e_shnum;
+    plthook->shstrtab_size = plthook->shdr[ehdr.e_shstrndx].sh_size;
     plthook->shstrtab = malloc(plthook->shstrtab_size);
     if (plthook->shstrtab == NULL) {
         set_errmsg("failed to allocate memory: %" SIZE_T_FMT " bytes", plthook->shstrtab_size);
         rv = PLTHOOK_OUT_OF_MEMORY;
         goto error_exit;
     }
-    offset = plthook->shdr[ehdr->e_shstrndx].sh_offset;
+    offset = plthook->shdr[ehdr.e_shstrndx].sh_offset;
     if (lseek(fd, offset, SEEK_SET) != offset) {
         set_errmsg("failed to seek to the section header string table.");
         rv = PLTHOOK_INVALID_FILE_FORMAT;
@@ -369,13 +416,13 @@ static int plthook_open_real(plthook_t **plthook_out, const char *base, const ch
     if (page_size == 0) {
         page_size = sysconf(_SC_PAGESIZE);
     }
-    offset = ehdr->e_phoff;
+    offset = ehdr.e_phoff;
     if ((rv = lseek(fd, offset, SEEK_SET)) != offset) {
         set_errmsg("failed to seek to the program header table.");
         rv = PLTHOOK_INVALID_FILE_FORMAT;
         goto error_exit;
     }
-    for (idx = 0; idx < ehdr->e_phnum; idx++) {
+    for (idx = 0; idx < ehdr.e_phnum; idx++) {
         Elf_Phdr phdr;
         if (read(fd, &phdr, sizeof(phdr)) != sizeof(phdr)) {
             set_errmsg("failed to read the program header table.");
@@ -396,12 +443,12 @@ static int plthook_open_real(plthook_t **plthook_out, const char *base, const ch
         goto error_exit;
     }
     if (shdr->sh_type != SHT_DYNSYM) {
-        set_errmsg("The type of .dynsym section should be SHT_DYNSYM but %d.", shdr->sh_type);
+        set_errmsg("The type of .dynsym section should be SHT_DYNSYM but %" ELF_WORD_FMT ".", shdr->sh_type);
         rv = PLTHOOK_INVALID_FILE_FORMAT;
         goto error_exit;
     }
     if (shdr->sh_entsize != sizeof(Elf_Sym)) {
-        set_errmsg("The size of a section header entry should be sizeof(Elf_Sym)(%" SIZE_T_FMT ") but %" SIZE_T_FMT ".",
+        set_errmsg("The size of a section header entry should be sizeof(Elf_Sym)(%" SIZE_T_FMT ") but %" ELF_XWORD_FMT ".",
                    sizeof(Elf_Sym), shdr->sh_entsize);
         rv = PLTHOOK_INVALID_FILE_FORMAT;
         goto error_exit;
@@ -414,7 +461,7 @@ static int plthook_open_real(plthook_t **plthook_out, const char *base, const ch
         goto error_exit;
     }
     if (shdr->sh_type != SHT_STRTAB) {
-        set_errmsg("The type of .dynstrx section should be SHT_STRTAB but %d.", shdr->sh_type);
+        set_errmsg("The type of .dynstrx section should be SHT_STRTAB but %" ELF_WORD_FMT ".", shdr->sh_type);
         rv = PLTHOOK_INVALID_FILE_FORMAT;
         goto error_exit;
     }
@@ -422,11 +469,18 @@ static int plthook_open_real(plthook_t **plthook_out, const char *base, const ch
     plthook->dynstr_size = shdr->sh_size;
 
     rv = find_section(plthook, PLT_SECTION_NAME, &shdr);
+    plthook->r_type = R_JUMP_SLOT;
+#ifdef REL_DYN_SECTION_NAME
+    if (rv != 0) {
+        rv = find_section(plthook, REL_DYN_SECTION_NAME, &shdr);
+        plthook->r_type = R_GLOBAL_DATA;
+    }
+#endif
     if (rv != 0) {
         goto error_exit;
     }
     if (shdr->sh_entsize != sizeof(Elf_Plt_Rel)) {
-        set_errmsg("invalid " PLT_SECTION_NAME " table entry size: %" SIZE_T_FMT, shdr->sh_entsize);
+        set_errmsg("invalid " PLT_SECTION_NAME " table entry size: %" ELF_XWORD_FMT, shdr->sh_entsize);
         rv = PLTHOOK_INVALID_FILE_FORMAT;
         goto error_exit;
     }
@@ -447,7 +501,7 @@ int plthook_enum(plthook_t *plthook, unsigned int *pos, const char **name_out, v
 {
     while (*pos < plthook->plt_cnt) {
         const Elf_Plt_Rel *plt = plthook->plt + *pos;
-        if (ELF_R_TYPE(plt->r_info) == R_JUMP_SLOT) {
+        if (ELF_R_TYPE(plt->r_info) == plthook->r_type) {
             size_t idx = ELF_R_SYM(plt->r_info);
 
             if (idx >= plthook->dynsym_cnt) {
@@ -550,27 +604,28 @@ static int check_elf_header(const Elf_Ehdr *ehdr)
         set_errmsg("invalid elf version: 0x%02x", ehdr->e_ident[EI_VERSION]);
         return PLTHOOK_INVALID_FILE_FORMAT;
     }
-    if (ehdr->e_ident[EI_OSABI] != ELF_OSABI) {
+    if (ehdr->e_ident[EI_OSABI] != ELF_OSABI
 #ifdef ELF_OSABI_ALT
-        if (ehdr->e_ident[EI_OSABI] != ELF_OSABI_ALT) {
-            set_errmsg("invalid OS ABI: 0x%02x", ehdr->e_ident[EI_OSABI]);
-            return PLTHOOK_INVALID_FILE_FORMAT;
-        }
-#else
+        && ehdr->e_ident[EI_OSABI] != ELF_OSABI_ALT
+#endif
+        ) {
         set_errmsg("invalid OS ABI: 0x%02x", ehdr->e_ident[EI_OSABI]);
         return PLTHOOK_INVALID_FILE_FORMAT;
-#endif
     }
     if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) {
         set_errmsg("invalid file type: 0x%04x", ehdr->e_type);
         return PLTHOOK_INVALID_FILE_FORMAT;
     }
-    if (ehdr->e_machine != E_MACHINE) {
+    if (ehdr->e_machine != E_MACHINE
+#ifdef E_MACHINE_ALT
+        && ehdr->e_machine != E_MACHINE_ALT
+#endif
+        ) {
         set_errmsg("invalid machine type: %u", ehdr->e_machine);
         return PLTHOOK_INVALID_FILE_FORMAT;
     }
     if (ehdr->e_version != EV_CURRENT) {
-        set_errmsg("invalid object file version: %u", ehdr->e_version);
+        set_errmsg("invalid object file version: %" ELF_WORD_FMT, ehdr->e_version);
         return PLTHOOK_INVALID_FILE_FORMAT;
     }
     if (ehdr->e_ehsize != sizeof(Elf_Ehdr)) {
@@ -596,7 +651,7 @@ static int find_section(plthook_t *image, const char *name, const Elf_Shdr **out
 
     while (shdr < shdr_end) {
         if (shdr->sh_name + namelen >= image->shstrtab_size) {
-            set_errmsg("too big section header string table index: %u", shdr->sh_name);
+            set_errmsg("too big section header string table index: %" ELF_WORD_FMT, shdr->sh_name);
             return PLTHOOK_INVALID_FILE_FORMAT;
         }
         if (strcmp(image->shstrtab + shdr->sh_name, name) == 0) {
